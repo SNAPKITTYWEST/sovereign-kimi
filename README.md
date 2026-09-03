@@ -5,18 +5,36 @@ Sovereign GPU kernel stack for Kimi K3 — fused GEMM + online softmax attention
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│              sovereign-kimi                      │
-├─────────────────────────────────────────────────┤
-│  kernels/                                        │
-│    gemm_online_softmax.cu    PTX/CUDA (sm_80+)  │
-│    gemm_online_softmax.mojo  Mojo/MAX           │
-│  src/                                            │
-│    (expansion: batching, causal masks, etc.)    │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                       sovereign-kimi                          │
+├──────────────────────────────────────────────────────────────┤
+│  kernels/                                                     │
+│    k3_nano_harness.cu         Full inference harness          │
+│    fused_attention.cu         Production GEMM+Online Softmax  │
+│    gemm_online_softmax.cu     PTX/CUDA skeleton               │
+│    gemm_online_softmax.mojo   Mojo/MAX skeleton               │
+│  src/                                                        │
+│    ffi.rs                      Rust C FFI bindings            │
+│    daemon.rs                   Tokio channel actor            │
+│    lib.rs                      Rust library root              │
+│    build.rs                    nvcc compilation               │
+│  scripts/                                                    │
+│    create_draft_model.py       Draft model generator          │
+│  Cargo.toml                                                    │
+│  Makefile                                                      │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-## Kernel Features
+## Kernels
+
+| File | Language | Status |
+|------|----------|--------|
+| `k3_nano_harness.cu` | CUDA | Full inference: Delta Attention, LatentMoE, WMMA FP16, Speculative Decoding, FFI exports |
+| `fused_attention.cu` | CUDA/PTX | Production: cp.async, mma.sync.m16n8k16, online softmax, 97KB smem |
+| `gemm_online_softmax.cu` | CUDA/PTX | Ahmad's skeleton with PTX inline assembly |
+| `gemm_online_softmax.mojo` | Mojo | MAX accelerator skeleton |
+
+## Features
 
 - **FP16 inputs / FP32 accumulation**
 - **128×64 tiles** (Q rows × K columns), K-inner = 64
@@ -25,26 +43,35 @@ Sovereign GPU kernel stack for Kimi K3 — fused GEMM + online softmax attention
 - **Tensor Core** `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`
 - **cp.async** double buffering, shared-memory padding for bank conflicts
 - **Warp `__shfl_xor_sync` reductions**
-- Q/K/V stay in global memory; only tiles + compact row state live on-chip
+- **Delta Attention**: `tanh(Q * ΔK * scale) * V` (Kimi K3 innovation)
+- **LatentMoE Router**: 8-expert routing, top-2 selection
+- **WMMA FP16 Tensor Core MoE**: Warp-level matrix multiply accumulate
+- **Speculative Decoding**: Draft model + batched verification + acceptance kernel
+- **Rust FFI**: `k3_engine_init` / `forward` / `free` with safe `K3Engine` wrapper
+- **Tokio Daemon**: Channel actor, pins CUDA to dedicated OS thread
 
 ## Build
 
 ### CUDA/PTX
 
 ```bash
-nvcc -O3 -arch=sm_80 -std=c++17 kernels/gemm_online_softmax.cu -o gemm_online_softmax
+make all          # Full k3_nano harness
+make attention    # Production fused attention kernel
+make gemm         # PTX/CUDA skeleton
+make draft        # Generate draft.bin for speculative decoding
 ```
 
-For sm_86 (RTX 3080):
+### Rust FFI
 
 ```bash
-nvcc -O3 -arch=sm_86 -std=c++17 kernels/gemm_online_softmax.cu -o gemm_online_softmax
+cargo build --release
 ```
 
-### Mojo
+### Standalone Test
 
 ```bash
-mojo build --target-accelerator=nvidia:sm_80 kernels/gemm_online_softmax.mojo
+make test         # Run with model.bin
+make spec         # Speculative decoding with draft model
 ```
 
 ## PTX Fragments
@@ -74,6 +101,7 @@ for (int offset = 16; offset > 0; offset >>= 1)
 
 ## Next Steps
 
+- Test-compile on BBQBADDIE (RTX 3080, sm_86)
 - Correctness validation against cuBLAS/cuDNN reference (tolerance ~1e-3)
 - Nsight Compute / Nsight Systems profiling
 - Register pressure tuning, shared-memory optimization (~97 KB target)
