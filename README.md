@@ -1,118 +1,157 @@
+<div align="center">
+
 # sovereign-kimi
 
-Sovereign GPU kernel stack for Kimi K3 — fused GEMM + online softmax attention (FlashAttention-style block tiling) for Ampere+ (sm_80+).
+**Kimi K3 Nano CUDA Attention Kernels · GEMM + Online Softmax · WMMA FP16 · Speculative Decoding**
 
-## Architecture
+[![License: Sovereign](https://img.shields.io/badge/License-Sovereign%20v1.0-blue.svg)](LICENSE)
+[![License: BSL-1.1](https://img.shields.io/badge/License-BSL--1.1-green.svg)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-red.svg)](LICENSE)
+[![CUDA](https://img.shields.io/badge/Language-CUDA%20C++-ff6f00.svg)](k3_nano/kernels/)
+[![Mojo](https://img.shields.io/badge/Language-Mojo-ff2d55.svg)](k3_nano/kernels/)
+[![Rust](https://img.shields.io/badge/Language-Rust-ce4225.svg)](k3_nano/src/)
+[![FP16](https://img.shields.io/badge/Compute-FP16%20WMMA-9cf.svg)](k3_nano/kernels/)
+[![cuDNN](https://img.shields.io/badge/Backend-cuDNN%209-76b900.svg)](k3_nano/)
 
+Sovereign GPU attention engine: fused GEMM + online softmax, WMMA tensor core kernels, speculative decoding, Rust FFI, and a production inference harness.
+
+</div>
+
+---
+
+## Kernel Pipeline
+
+```mermaid
+graph LR
+    subgraph Input
+        Q[Query]
+        K[Key]
+        V[Value]
+    end
+    subgraph GEMM["Fused GEMM + Softmax"]
+        G1[GEMM: Q × Kᵀ] --> G2[Online Softmax<br/>running max + denom]
+        G2 --> G3[Scale by √d]
+        G3 --> G4[Attention Weights]
+    end
+    subgraph Output
+        G4 --> G5[GEMM: P × V]
+        G5 --> OUT[Output]
+    end
+    Q --> G1
+    K --> G1
+    V --> G5
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                       sovereign-kimi                          │
-├──────────────────────────────────────────────────────────────┤
-│  kernels/                                                     │
-│    k3_nano_harness.cu         Full inference harness          │
-│    fused_attention.cu         Production GEMM+Online Softmax  │
-│    gemm_online_softmax.cu     PTX/CUDA skeleton               │
-│    gemm_online_softmax.mojo   Mojo/MAX skeleton               │
-│  src/                                                        │
-│    ffi.rs                      Rust C FFI bindings            │
-│    daemon.rs                   Tokio channel actor            │
-│    lib.rs                      Rust library root              │
-│    build.rs                    nvcc compilation               │
-│  scripts/                                                    │
-│    create_draft_model.py       Draft model generator          │
-│  Cargo.toml                                                    │
-│  Makefile                                                      │
-└──────────────────────────────────────────────────────────────┘
+
+## Harness Architecture
+
+```mermaid
+graph TB
+    subgraph "k3_nano_harness.cu"
+        H1[Main Loop] --> H2[Load Weights<br/>from GGUF]
+        H2 --> H3[Token Embed]
+        H3 --> H4[Transformer Layers<br/>× N]
+        H4 --> H5[LM Head]
+        H5 --> H6[Token Out]
+    end
+    subgraph "kernels/"
+        K1[fused_attention.cu<br/>GEMM+Online Softmax]
+        K2[gemm_online_softmax.cu<br/>PTX/CUDA skeleton]
+        K3[gemm_online_softmax.mojo<br/>Mojo/MAX skeleton]
+    end
+    subgraph "src/"
+        S1[daemon.rs<br/>Tokio Channel Actor]
+        S2[ffi.rs<br/>Rust C FFI Bindings]
+    end
+    H4 --> K1
+    H4 --> K2
+    S1 --> H1
+    S2 --> H1
 ```
 
-## Kernels
+## Kernel Files
 
-| File | Language | Status |
-|------|----------|--------|
-| `k3_nano_harness.cu` | CUDA | Full inference: Delta Attention, LatentMoE, WMMA FP16, Speculative Decoding, FFI exports |
-| `fused_attention.cu` | CUDA/PTX | Production: cp.async, mma.sync.m16n8k16, online softmax, 97KB smem |
-| `gemm_online_softmax.cu` | CUDA/PTX | Ahmad's skeleton with PTX inline assembly |
-| `gemm_online_softmax.mojo` | Mojo | MAX accelerator skeleton |
+| File | Type | Description |
+|------|------|-------------|
+| `kernels/fused_attention.cu` | CUDA C++ | Production GEMM + online softmax kernel |
+| `kernels/gemm_online_softmax.cu` | PTX/CUDA | PTX-level skeleton with inline assembly |
+| `kernels/gemm_online_softmax.mojo` | Mojo/MAX | GPU kernel skeleton for MAX runtime |
 
-## Features
+## Fused Attention Flow
 
-- **FP16 inputs / FP32 accumulation**
-- **128×64 tiles** (Q rows × K columns), K-inner = 64
-- **128-thread blocks** (4 warps)
-- **Online softmax** with running max + denominator (no full S or P matrix)
-- **Tensor Core** `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`
-- **cp.async** double buffering, shared-memory padding for bank conflicts
-- **Warp `__shfl_xor_sync` reductions**
-- **Delta Attention**: `tanh(Q * ΔK * scale) * V` (Kimi K3 innovation)
-- **LatentMoE Router**: 8-expert routing, top-2 selection
-- **WMMA FP16 Tensor Core MoE**: Warp-level matrix multiply accumulate
-- **Speculative Decoding**: Draft model + batched verification + acceptance kernel
-- **Rust FFI**: `k3_engine_init` / `forward` / `free` with safe `K3Engine` wrapper
-- **Tokio Daemon**: Channel actor, pins CUDA to dedicated OS thread
+```mermaid
+sequenceDiagram
+    participant Host
+    participant GPU
+    participant SRAM
+
+    Host->>GPU: Launch kernel (Q, K, V, d, N)
+    loop For each tile
+        GPU->>SRAM: Load Q tile (128×64)
+        GPU->>SRAM: Load K tile (64×64)
+        SRAM->>GPU: GEMM: S = Q × Kᵀ
+        Note over GPU: Online Softmax<br/>m_new = max(m, tile_max)<br/>d = d × exp(m−m_new) + Σexp(s−m_new)
+        GPU->>SRAM: Load V tile (64×64)
+        SRAM->>GPU: GEMM: O = P × V
+    end
+    GPU->>Host: Return output
+```
+
+## Rust FFI + Daemon
+
+```mermaid
+graph LR
+    PY[Python Caller] -->|C ABI| FFI[ffi.rs<br/>extern C]
+    FFI --> DAEMON[daemon.rs<br/>Tokio Actor]
+    DAEMON -->|channel| HGPU[k3_nano_harness.cu]
+    HGPU -->|result| DAEMON
+    DAEMON -->|channel| FFI
+    FFI -->|result| PY
+```
 
 ## Build
 
-### CUDA/PTX
-
 ```bash
-make all          # Full k3_nano harness
-make attention    # Production fused attention kernel
-make gemm         # PTX/CUDA skeleton
-make draft        # Generate draft.bin for speculative decoding
+cd k3_nano
+
+# Full build (all kernels)
+make all
+
+# Individual targets
+make attention      # fused_attention only
+make gemm           # gemm_online_softmax only
+make draft          # speculative drafting
+make test           # compile + run test
+make spec           # load spec from config/g6_architecture.json
 ```
 
-### Rust FFI
+## Speculative Decoding
 
-```bash
-cargo build --release
+```mermaid
+graph TD
+    DRAFT[Draft Model<br/>K3 Nano 0.3B] -->|k candidates| VERIFY[Verify Step<br/>full model]
+    VERIFY -->|accepted| TOKEN[Token Output]
+    VERIFY -->|rejected| RETRY[Retry with<br/>new candidates]
+    RETRY --> DRAFT
 ```
 
-### Standalone Test
+## G6 Architecture
 
-```bash
-make test         # Run with model.bin
-make spec         # Speculative decoding with draft model
-```
+| Parameter | Value |
+|-----------|-------|
+| Draft model | K3 Nano 0.3B |
+| Target model | G6 6.15B |
+| Speculation depth | k=4 |
+| Acceptance rate target | ≥70% |
+| Latency reduction | 2–3× |
 
-## PTX Fragments
+---
 
-```ptx
-// Tensor Core MMA (Ampere)
-mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
-    { %f0, %f1, %f2, %f3 },  // C (FP32)
-    { %r0, %r1, %r2, %r3 },  // A (FP16)
-    { %r4, %r5 },             // B (FP16)
-    { %f0, %f1, %f2, %f3 };  // C in
+## Topics
 
-// Async copy (double-buffer)
-cp.async.cg.shared.global [smem_addr], [gmem_addr], 16;
-cp.async.commit_group;
-cp.async.wait_group 0;
-```
+`CUDA` `attention` `GEMM` `online-softmax` `WMMA` `FP16` `tensor-cores` `speculative-decoding` `Kimi` `K3-Nano` `Rust-FFI` `Mojo` `Mojo-MAX` `GPU-kernels` `sovereign`
 
-## Online Softmax
+---
 
-```cuda
-float warp_max = val;
-#pragma unroll
-for (int offset = 16; offset > 0; offset >>= 1)
-    warp_max = fmaxf(warp_max, __shfl_xor_sync(0xffffffff, warp_max, offset));
-```
-
-## Next Steps
-
-- Test-compile on BBQBADDIE (RTX 3080, sm_86)
-- Correctness validation against cuBLAS/cuDNN reference (tolerance ~1e-3)
-- Nsight Compute / Nsight Systems profiling
-- Register pressure tuning, shared-memory optimization (~97 KB target)
-- Multi-head batching, causal masks, variable sequence lengths
-- Hopper/Blackwell extensions (TMA + WGMMA)
-
-## License
-
-Sovereign Source License v1.0 + BSL-1.1 + AGPL-3.0 (tri-license)
-
-## Author
+**Sovereign Source License v1.0 + BSL-1.1 + AGPL-3.0 (tri-license)**
 
 Ahmad Ali Parr · Bel Esprit D'Accord Irrevocable Trust · EIN 42-697643
-Contact: Ahmad <ahmedparr93@gmail.com>
